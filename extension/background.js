@@ -1,7 +1,38 @@
+// Cross-browser shim
 const api = globalThis.browser || globalThis.chrome;
 
-// Tracks which tabs currently have the extension turned on
-const enabledTabs = new Set();
+// Persistent bookkeeping
+
+const STATE_KEY = 'wa-bg-state';
+let statePromise = null;
+
+function emptyState() {
+  return { enabledTabs: [], tabRooms: {}, roomTabs: {} };
+}
+
+async function loadState() {
+  if (!statePromise) {
+    statePromise = (async () => {
+      try {
+        const stored = await api.storage.session.get(STATE_KEY);
+        return stored[STATE_KEY] || emptyState();
+      } catch (e) {
+        // Storage.session unavailable in this browser
+        // Fall back to a fresh in-memory-only state
+        return emptyState();
+      }
+    })();
+  }
+  return statePromise;
+}
+
+async function saveState(state) {
+  statePromise = Promise.resolve(state);
+  try {
+    await api.storage.session.set({ [STATE_KEY]: state });
+  } catch (e) {
+  }
+}
 
 function setBadge(tabId, on) {
   api.action.setBadgeText({ tabId, text: on ? 'ON' : '' });
@@ -10,9 +41,13 @@ function setBadge(tabId, on) {
 
 api.action.onClicked.addListener(async (tab) => {
   if (!tab || tab.id == null) return;
-  const nextEnabled = !enabledTabs.has(tab.id);
-  if (nextEnabled) enabledTabs.add(tab.id);
-  else enabledTabs.delete(tab.id);
+  const state = await loadState();
+  const enabledSet = new Set(state.enabledTabs);
+  const nextEnabled = !enabledSet.has(tab.id);
+  if (nextEnabled) enabledSet.add(tab.id);
+  else enabledSet.delete(tab.id);
+  state.enabledTabs = [...enabledSet];
+  await saveState(state);
   setBadge(tab.id, nextEnabled);
 
   try {
@@ -22,17 +57,26 @@ api.action.onClicked.addListener(async (tab) => {
   }
 });
 
-api.tabs.onUpdated.addListener((tabId, changeInfo) => {
+// A fresh navigation means the content script re-injects in a disabled state
+api.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === 'loading') {
-    enabledTabs.delete(tabId);
+    const state = await loadState();
+    const enabledSet = new Set(state.enabledTabs);
+    enabledSet.delete(tabId);
+    state.enabledTabs = [...enabledSet];
+    await saveState(state);
     setBadge(tabId, false);
-    leaveRoom(tabId);
+    await leaveRoom(tabId);
   }
 });
 
-api.tabs.onRemoved.addListener((tabId) => {
-  enabledTabs.delete(tabId);
-  leaveRoom(tabId);
+api.tabs.onRemoved.addListener(async (tabId) => {
+  const state = await loadState();
+  const enabledSet = new Set(state.enabledTabs);
+  enabledSet.delete(tabId);
+  state.enabledTabs = [...enabledSet];
+  await saveState(state);
+  await leaveRoom(tabId);
 });
 
 // Realtime relay
@@ -55,34 +99,38 @@ async function ensureOffscreen() {
   return offscreenReadyPromise;
 }
 
-// Route server message for a room to every tab viewing the room
-// Tell the offscreen document when a room has no tabs left and socket can be closed
-const tabRooms = new Map();
-const roomTabs = new Map();
-
-function joinRoom(tabId, room) {
-  leaveRoom(tabId);
-  tabRooms.set(tabId, room);
-  if (!roomTabs.has(room)) roomTabs.set(room, new Set());
-  roomTabs.get(room).add(tabId);
+// tabId to room key; room key -> [tabId]
+// Lets us route incoming server message for a room to every tab viewing the room
+// Tell the offscreen document when a room has no tabs left and its socket can be closed
+async function joinRoom(tabId, room) {
+  await leaveRoom(tabId); // in case tab was already in a different room
+  const state = await loadState();
+  state.tabRooms[tabId] = room;
+  if (!state.roomTabs[room]) state.roomTabs[room] = [];
+  if (!state.roomTabs[room].includes(tabId)) state.roomTabs[room].push(tabId);
+  await saveState(state);
 }
 
-function leaveRoom(tabId) {
-  const room = tabRooms.get(tabId);
+async function leaveRoom(tabId) {
+  const state = await loadState();
+  const room = state.tabRooms[tabId];
   if (!room) return;
-  tabRooms.delete(tabId);
-  const tabs = roomTabs.get(room);
+  delete state.tabRooms[tabId];
+  const tabs = state.roomTabs[room];
   if (tabs) {
-    tabs.delete(tabId);
-    if (tabs.size === 0) {
-      roomTabs.delete(room);
+    const idx = tabs.indexOf(tabId);
+    if (idx !== -1) tabs.splice(idx, 1);
+    if (tabs.length === 0) {
+      delete state.roomTabs[room];
       api.runtime.sendMessage({ type: 'wa-off-disconnect', room }).catch(() => {});
     }
   }
+  await saveState(state);
 }
 
-function tellTabs(room, message) {
-  const tabs = roomTabs.get(room);
+async function tellTabs(room, message) {
+  const state = await loadState();
+  const tabs = state.roomTabs[room];
   if (!tabs) return;
   tabs.forEach((tabId) => {
     api.tabs.sendMessage(tabId, message).catch(() => {});
@@ -96,17 +144,18 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'wa-rt-connect') {
     const tabId = sender.tab && sender.tab.id;
     if (tabId == null) return;
-    joinRoom(tabId, msg.room);
-    ensureOffscreen().then(() => {
-      api.runtime
-        .sendMessage({
-          type: 'wa-off-connect',
-          room: msg.room,
-          serverUrl: msg.serverUrl,
-          clientId: msg.clientId,
-        })
-        .catch(() => {});
-    });
+    joinRoom(tabId, msg.room).then(() =>
+      ensureOffscreen().then(() => {
+        api.runtime
+          .sendMessage({
+            type: 'wa-off-connect',
+            room: msg.room,
+            serverUrl: msg.serverUrl,
+            clientId: msg.clientId,
+          })
+          .catch(() => {});
+      })
+    );
     return;
   }
 
@@ -126,9 +175,12 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // From the offscreen document
   if (msg.type === 'wa-off-event') {
-    const { room, event, payload } = msg;
+    const { room, event, payload, status } = msg;
     if (event === 'open') {
       tellTabs(room, { type: 'wa-rt-status', status: 'connected' });
+    } else if (event === 'status') {
+      // Sent when offscreen.js is asked to connect a room that already has a live socket
+      tellTabs(room, { type: 'wa-rt-status', status });
     } else if (event === 'close') {
       tellTabs(room, { type: 'wa-rt-status', status: 'disconnected' });
     } else if (event === 'message') {

@@ -1,15 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "Web Annotator (Prototype)",
-  "version": "0.2.0",
-  "description": "Highlight, comment on, and draw (pencil, shapes, text) over any webpage, with custom colors and undo/redo. Click the toolbar icon to turn it on for the current tab. Annotations persist locally, re-anchor on reload, and sync live with anyone else viewing the same page via a small realtime server.",
+  "name": "CoScribble",
+  "version": "0.3.0",
+  "description": "Highlight, comment on, and draw over any webpage with others live. Click the toolbar icon to turn it on for the current tab.",
   "permissions": ["storage", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Toggle Web Annotator on this page"
+    "default_title": "Toggle CoScribble on this page"
   },
   "content_scripts": [
     {

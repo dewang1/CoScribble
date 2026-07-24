@@ -4,6 +4,7 @@
   if (window.__waInjected) return;
   window.__waInjected = true;
 
+  // Cross-browser shim
   const api = globalThis.browser || globalThis.chrome;
 
   function newId(prefix) {
@@ -34,7 +35,7 @@
     return `wa:${url.origin}${url.pathname}${url.search}${hashPart}`;
   }
  
-  const PAGE_KEY = storageKeyForThisPage();
+  let PAGE_KEY = storageKeyForThisPage();
  
   let pageData = { highlights: [], drawings: [] };
   let pageDataLoaded = false;
@@ -49,42 +50,179 @@
     await api.storage.local.set({ [PAGE_KEY]: pageData });
   }
 
-  // Undo / redo history
+  // Conflict resolution
+
+  let lamportClock = 0;
+
+  // One stamp per user action, so multiple ops from the same action are tagged consistently.
+  function nextStamp() {
+    lamportClock += 1;
+    return { lamport: lamportClock, clientId: rtClientId };
+  }
+
+  // Standard Lamport clock rule
+  function observeStamp(stamp) {
+    if (stamp && typeof stamp.lamport === 'number') {
+      lamportClock = Math.max(lamportClock, stamp.lamport) + 1;
+    }
+  }
+
+  function stampWins(a, b) {
+    if (!b) return true;
+    if (!a) return false;
+    if (a.lamport !== b.lamport) return a.lamport > b.lamport;
+    if (a.clientId !== b.clientId) return a.clientId > b.clientId;
+    return true;
+  }
+
+  // The one place that mutates pageData in response to an op
+  function applyOp(op) {
+    observeStamp(op.stamp);
+    switch (op.kind) {
+      case 'upsert_highlight': {
+        let h = pageData.highlights.find((x) => x.id === op.id);
+        if (!h) {
+          h = {
+            id: op.id,
+            anchor: op.anchor,
+            color: op.color,
+            createdAt: op.createdAt,
+            note: '',
+            _presenceStamp: op.stamp,
+            _noteStamp: op.stamp,
+            _deleted: false,
+          };
+          pageData.highlights.push(h);
+        } else if (stampWins(op.stamp, h._presenceStamp)) {
+          h.anchor = op.anchor;
+          h.color = op.color;
+          h.createdAt = op.createdAt;
+          h._deleted = false;
+          h._presenceStamp = op.stamp;
+        }
+        break;
+      }
+      case 'delete_highlight': {
+        const h = pageData.highlights.find((x) => x.id === op.id);
+        if (h && stampWins(op.stamp, h._presenceStamp)) {
+          h._deleted = true;
+          h._presenceStamp = op.stamp;
+        }
+        break;
+      }
+      case 'update_note': {
+        const h = pageData.highlights.find((x) => x.id === op.id);
+        if (h && stampWins(op.stamp, h._noteStamp)) {
+          h.note = op.note;
+          h.updatedAt = op.updatedAt;
+          h._noteStamp = op.stamp;
+        }
+        break;
+      }
+      case 'upsert_drawing': {
+        let d = pageData.drawings.find((x) => x.id === op.id);
+        if (!d) {
+          d = { ...op.data, id: op.id, _presenceStamp: op.stamp, _deleted: false };
+          pageData.drawings.push(d);
+        } else if (stampWins(op.stamp, d._presenceStamp)) {
+          Object.assign(d, op.data);
+          d._deleted = false;
+          d._presenceStamp = op.stamp;
+        }
+        break;
+      }
+      case 'delete_drawing': {
+        const d = pageData.drawings.find((x) => x.id === op.id);
+        if (d && stampWins(op.stamp, d._presenceStamp)) {
+          d._deleted = true;
+          d._presenceStamp = op.stamp;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  // Strips CRDT bookkeeping fields off a drawing before it is used as the data payload of an upsert
+  function cleanDrawingData(d) {
+    const { _presenceStamp, _deleted, id, ...rest } = d;
+    return rest;
+  }
+
+  // Undo / redo history (Op based)
 
   const HISTORY_LIMIT = 50;
   let undoStack = [];
   let redoStack = [];
 
-  function snapshotState() {
-    return JSON.parse(JSON.stringify({ highlights: pageData.highlights, drawings: pageData.drawings }));
-  }
-
-  function pushHistory() {
-    undoStack.push(snapshotState());
+  function pushUndoRedo(doOps, undoOps) {
+    undoStack.push({ undo: undoOps, redo: doOps });
     if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
     redoStack = [];
   }
 
-  async function undo() {
-    if (!undoStack.length) return;
-    redoStack.push(snapshotState());
-    const prev = undoStack.pop();
-    pageData.highlights = prev.highlights;
-    pageData.drawings = prev.drawings;
+  // Walks live drawings whose parentId chain leads back to rootId
+  function descendantsOf(rootId) {
+    const result = [];
+    const stack = [rootId];
+    while (stack.length) {
+      const pid = stack.pop();
+      pageData.drawings.forEach((d) => {
+        if (!d._deleted && d.parentId === pid) {
+          result.push(d);
+          stack.push(d.id);
+        }
+      });
+    }
+    return result;
+  }
+
+  // A recorded undo/redo entry pairs each op with its exact reverse, both frozen at the moment the entry was created
+  function expandDrawingHistoryOps(bareOps, pairedOps) {
+    const expandedBare = [];
+    const expandedPaired = [];
+    bareOps.forEach((op, i) => {
+      const descendants = op.kind === 'delete_drawing' ? descendantsOf(op.id) : [];
+      if (descendants.length === 0) {
+        expandedBare.push(op);
+        expandedPaired.push(pairedOps[i]);
+        return;
+      }
+      expandedBare.push(op);
+      expandedPaired.push(op);
+      descendants.forEach((d) => {
+        expandedBare.push({ kind: 'delete_drawing', id: d.id });
+        expandedPaired.push({ kind: 'upsert_drawing', id: d.id, data: cleanDrawingData(d) });
+      });
+    });
+    return { bare: expandedBare, paired: expandedPaired };
+  }
+
+  async function applyOpsBatch(bareOps) {
+    const stamp = nextStamp();
+    const stamped = bareOps.map((o) => ({ ...o, stamp }));
+    stamped.forEach(applyOp);
     await savePageData();
     renderAllHighlights();
     renderAllDrawings();
+    stamped.forEach(rtSend);
+  }
+
+  async function undo() {
+    const entry = undoStack.pop();
+    if (!entry) return;
+    const { bare, paired } = expandDrawingHistoryOps(entry.undo, entry.redo);
+    redoStack.push({ undo: bare, redo: paired });
+    await applyOpsBatch(bare);
   }
 
   async function redo() {
-    if (!redoStack.length) return;
-    undoStack.push(snapshotState());
-    const next = redoStack.pop();
-    pageData.highlights = next.highlights;
-    pageData.drawings = next.drawings;
-    await savePageData();
-    renderAllHighlights();
-    renderAllDrawings();
+    const entry = redoStack.pop();
+    if (!entry) return;
+    const { bare, paired } = expandDrawingHistoryOps(entry.redo, entry.undo);
+    undoStack.push({ undo: paired, redo: bare });
+    await applyOpsBatch(bare);
   }
 
   // Text anchoring
@@ -139,8 +277,8 @@
     return range;
   }
 
-  // Subtracts a set of occupied intervals from a new interval, returning the leftover pieces.
-  // New highlight never overlaps existing ones. Only new text becomes part of the new highlights.
+  // Subtracts a set of already-occupied intervals from a new interval, returning the leftover pieces
+  // Used so a new highlight never overlaps existing ones
   function subtractIntervals(start, end, occupied) {
     let pieces = [[start, end]];
     occupied.forEach(([occStart, occEnd]) => {
@@ -326,7 +464,6 @@
     });
     icon.addEventListener('mouseenter', () => setHighlightHover(id, true));
     icon.addEventListener('mouseleave', () => setHighlightHover(id, false));
-    
     icon.style.zIndex = '2147483645';
     document.documentElement.appendChild(icon);
     positionNoteIcon(icon, lastSpan);
@@ -356,6 +493,7 @@
   function renderAllHighlights() {
     clearRenderedAnnotations();
     pageData.highlights.forEach((h) => {
+      if (h._deleted) return;
       const range = resolveAnchorToRange(h.anchor);
       if (!range) {
         h.orphaned = true;
@@ -408,10 +546,15 @@
     deleteBtn.className = 'wa-delete';
     deleteBtn.textContent = 'Delete';
     deleteBtn.onclick = async () => {
-      pushHistory();
-      pageData.highlights = pageData.highlights.filter((h) => h.id !== id);
+      const snapshot = { anchor: highlight.anchor, color: highlight.color, createdAt: highlight.createdAt };
+      const op = { kind: 'delete_highlight', id, stamp: nextStamp() };
+      applyOp(op);
       removeHighlight(id);
-      rtSend({ type: 'delete_highlight', id });
+      rtSend(op);
+      pushUndoRedo(
+        [{ kind: 'delete_highlight', id }],
+        [{ kind: 'upsert_highlight', id, ...snapshot }]
+      );
       await savePageData();
       closePopover();
     };
@@ -420,10 +563,17 @@
     saveBtn.className = 'wa-save';
     saveBtn.textContent = 'Save';
     saveBtn.onclick = async () => {
-      pushHistory();
-      highlight.note = textarea.value.trim();
-      highlight.updatedAt = Date.now();
-      rtSend({ type: 'update_note', id: highlight.id, note: highlight.note, updatedAt: highlight.updatedAt });
+      const prevNote = highlight.note || '';
+      const prevUpdatedAt = highlight.updatedAt;
+      const newNote = textarea.value.trim();
+      const newUpdatedAt = Date.now();
+      const op = { kind: 'update_note', id: highlight.id, note: newNote, updatedAt: newUpdatedAt, stamp: nextStamp() };
+      applyOp(op);
+      rtSend(op);
+      pushUndoRedo(
+        [{ kind: 'update_note', id: highlight.id, note: newNote, updatedAt: newUpdatedAt }],
+        [{ kind: 'update_note', id: highlight.id, note: prevNote, updatedAt: prevUpdatedAt }]
+      );
       await savePageData();
       renderAllHighlights();
       closePopover();
@@ -431,7 +581,6 @@
 
     row.append(closeBtn, deleteBtn, saveBtn);
     pop.append(textarea, row);
-    
     document.documentElement.appendChild(pop);
     activePopover = pop;
     textarea.focus();
@@ -441,7 +590,7 @@
     if (activePopover && !activePopover.contains(e.target)) closePopover();
   });
 
-  // Color picker helpers 
+  // Color helpers for color pickers
 
   let normalizeCtx = null;
   function toHexColor(cssColor) {
@@ -462,12 +611,13 @@
   let drawLayer = null;
   let resizeObserverAttached = false;
 
+  // Current draw tool + shared style settings.
   let currentDrawTool = 'pencil'; // pencil | line | rect | ellipse |erase
   let drawColor = '#fde047';
   let drawOpacity = 1;
-  let radius = 12;
+  let radius = 12; // shared brush/eraser radius
 
-  // Make stroke radius consistent with eraser radius
+  // Make stroke radius and eraser radius consistent
   function strokeWidthFromRadius() {
     return radius * 2;
   }
@@ -476,11 +626,8 @@
     if (drawLayer) return drawLayer;
     drawLayer = document.createElementNS(SVG_NS, 'svg');
     drawLayer.id = 'wa-draw-layer';
-
     drawLayer.style.cssText = 'position: absolute; top: 0; left: 0; z-index: 2147483645;';
-    
     document.documentElement.appendChild(drawLayer);
-    
     resizeDrawLayer();
     if (!resizeObserverAttached) {
       const debouncedResize = debounce(resizeDrawLayer, 250);
@@ -546,6 +693,7 @@
     drawLayer.setAttribute('viewBox', `0 0 ${w} ${h}`);
   }
 
+  // Reposition note icons on real viewport resizes
   const debouncedReflow = debounce(() => {
     resizeDrawLayer();
     if (enabled) renderAllHighlights();
@@ -619,11 +767,13 @@
 
   function renderAllDrawings() {
     if (drawLayer) drawLayer.innerHTML = '';
-    pageData.drawings.forEach(renderDrawing);
+    pageData.drawings.forEach((d) => {
+      if (!d._deleted) renderDrawing(d);
+    });
     if (drawLayer && radiusPreviewEl) drawLayer.appendChild(radiusPreviewEl);
   }
 
-  // Used by eraser to erase drawings accurately
+  // Shape outline distance tests, used by eraser for accurate hitboxes
 
   function pointToSegmentDistance(p, a, b) {
     const abx = b.x - a.x;
@@ -671,28 +821,29 @@
     return Infinity;
   }
 
-  function eraseAt(center, radius) {
+  function eraseAt(center, radius, stamp) {
     let changed = false;
-    const next = [];
     pageData.drawings.forEach((d) => {
+      if (d._deleted) return;
       const type = d.type || 'freehand';
       const effectiveRadius = radius + (d.width || 3) / 2;
 
       if (type === 'freehand') {
         if (d.points.length < 2) {
           if (d.points.length === 1 && pointDist(d.points[0], center) <= effectiveRadius) {
+            applyOp({ kind: 'delete_drawing', id: d.id, stamp });
             changed = true;
-            eraseRemovedIds.add(d.id);
-          } else next.push(d);
+          }
           return;
         }
         const segments = [];
         let current = [d.points[0]];
+        let touched = false;
         for (let i = 0; i < d.points.length - 1; i++) {
           const a = d.points[i];
           const b = d.points[i + 1];
           if (pointToSegmentDistance(center, a, b) <= effectiveRadius) {
-            changed = true;
+            touched = true;
             if (current.length > 1) segments.push(current);
             current = [b];
           } else {
@@ -700,24 +851,27 @@
           }
         }
         if (current.length > 1) segments.push(current);
+        if (!touched) return;
         if (segments.length === 1 && segments[0].length === d.points.length) {
-          next.push(d);
-        } else {
-          eraseRemovedIds.add(d.id);
-          segments.forEach((seg) => {
-            const piece = { ...d, id: newId('d'), points: seg };
-            next.push(piece);
-            eraseAddedDrawings.push(piece);
-          });
+          return;
         }
-      } else if (shapeOutlineDistance(d, center) <= effectiveRadius) {
         changed = true;
-        eraseRemovedIds.add(d.id);
-      } else {
-        next.push(d);
+        applyOp({ kind: 'delete_drawing', id: d.id, stamp });
+        const rootId = d.parentId || d.id;
+        segments.forEach((seg) => {
+          const pieceId = newId('d');
+          applyOp({
+            kind: 'upsert_drawing',
+            id: pieceId,
+            data: { ...cleanDrawingData(d), points: seg, parentId: rootId },
+            stamp,
+          });
+        });
+      } else if (shapeOutlineDistance(d, center) <= effectiveRadius) {
+        applyOp({ kind: 'delete_drawing', id: d.id, stamp });
+        changed = true;
       }
     });
-    if (changed) pageData.drawings = next;
     return changed;
   }
 
@@ -729,8 +883,8 @@
   let currentFreehandPoints = [];
   let eraseActive = false;
   let eraseChangedThisStroke = false;
-  let eraseRemovedIds = new Set();
-  let eraseAddedDrawings = [];
+  let eraseStrokeStamp = null;
+  let eraseStrokeStartById = new Map(); // id to shallow copy of the drawing
 
   function toPagePoint(e) {
     return { x: e.pageX, y: e.pageY };
@@ -791,7 +945,7 @@
 
 
   function doerase(p) {
-    const changed = eraseAt(p, radius);
+    const changed = eraseAt(p, radius, eraseStrokeStamp);
     if (changed) {
       eraseChangedThisStroke = true;
       renderAllDrawings();
@@ -821,10 +975,11 @@
         ensureDrawLayer().appendChild(previewEl);
         break;
       case 'erase':
-        pushHistory();
+        eraseStrokeStamp = nextStamp();
+        eraseStrokeStartById = new Map(
+          pageData.drawings.filter((d) => !d._deleted).map((d) => [d.id, { ...d }])
+        );
         eraseChangedThisStroke = false;
-        eraseRemovedIds = new Set();
-        eraseAddedDrawings = [];
         eraseActive = true;
         doerase(p);
         break;
@@ -887,11 +1042,9 @@
           currentFreehandPoints.push({ ...currentFreehandPoints[0] });
           currentFreehandPath.setAttribute('d', pointsToPathD(currentFreehandPoints));
         }
-        pushHistory();
         const id = newId('d');
         currentFreehandPath.dataset.waId = id;
-        const drawing = {
-          id,
+        const data = {
           type: 'freehand',
           color: drawColor,
           opacity: drawOpacity,
@@ -899,8 +1052,10 @@
           points: currentFreehandPoints,
           createdAt: Date.now(),
         };
-        pageData.drawings.push(drawing);
-        rtSend({ type: 'add_drawing', drawing });
+        const op = { kind: 'upsert_drawing', id, data, stamp: nextStamp() };
+        applyOp(op);
+        rtSend(op);
+        pushUndoRedo([{ kind: 'upsert_drawing', id, data }], [{ kind: 'delete_drawing', id }]);
         await savePageData();
         currentFreehandPath = null;
         currentFreehandPoints = [];
@@ -910,13 +1065,15 @@
         if (!dragStart) break;
         const endPoint = snapLineEndpoint(dragStart, p, e.shiftKey);
         if (pointDist(dragStart, endPoint) > 2) {
-          pushHistory();
-          const drawing = {
-            id: newId('d'), type: 'line', color: drawColor, opacity: drawOpacity, width: strokeWidthFromRadius(),
+          const id = newId('d');
+          const data = {
+            type: 'line', color: drawColor, opacity: drawOpacity, width: strokeWidthFromRadius(),
             x1: dragStart.x, y1: dragStart.y, x2: endPoint.x, y2: endPoint.y, createdAt: Date.now(),
           };
-          pageData.drawings.push(drawing);
-          rtSend({ type: 'add_drawing', drawing });
+          const op = { kind: 'upsert_drawing', id, data, stamp: nextStamp() };
+          applyOp(op);
+          rtSend(op);
+          pushUndoRedo([{ kind: 'upsert_drawing', id, data }], [{ kind: 'delete_drawing', id }]);
           await savePageData();
         }
         if (previewEl) previewEl.remove();
@@ -929,13 +1086,15 @@
         if (!dragStart) break;
         const r = rectFromDrag(dragStart, p, e.shiftKey);
         if (r.w > 2 && r.h > 2) {
-          pushHistory();
-          const drawing = {
-            id: newId('d'), type: 'rect', color: drawColor, opacity: drawOpacity, width: strokeWidthFromRadius(),
+          const id = newId('d');
+          const data = {
+            type: 'rect', color: drawColor, opacity: drawOpacity, width: strokeWidthFromRadius(),
             x: r.x, y: r.y, w: r.w, h: r.h, createdAt: Date.now(),
           };
-          pageData.drawings.push(drawing);
-          rtSend({ type: 'add_drawing', drawing });
+          const op = { kind: 'upsert_drawing', id, data, stamp: nextStamp() };
+          applyOp(op);
+          rtSend(op);
+          pushUndoRedo([{ kind: 'upsert_drawing', id, data }], [{ kind: 'delete_drawing', id }]);
           await savePageData();
         }
         if (previewEl) previewEl.remove();
@@ -948,13 +1107,15 @@
         if (!dragStart) break;
         const el = ellipseFromDrag(dragStart, p, e.shiftKey);
         if (el.rx > 2 && el.ry > 2) {
-          pushHistory();
-          const drawing = {
-            id: newId('d'), type: 'ellipse', color: drawColor, opacity: drawOpacity, width: strokeWidthFromRadius(),
+          const id = newId('d');
+          const data = {
+            type: 'ellipse', color: drawColor, opacity: drawOpacity, width: strokeWidthFromRadius(),
             cx: el.cx, cy: el.cy, rx: el.rx, ry: el.ry, createdAt: Date.now(),
           };
-          pageData.drawings.push(drawing);
-          rtSend({ type: 'add_drawing', drawing });
+          const op = { kind: 'upsert_drawing', id, data, stamp: nextStamp() };
+          applyOp(op);
+          rtSend(op);
+          pushUndoRedo([{ kind: 'upsert_drawing', id, data }], [{ kind: 'delete_drawing', id }]);
           await savePageData();
         }
         if (previewEl) previewEl.remove();
@@ -965,11 +1126,26 @@
       }
       case 'erase': {
         if (eraseActive && eraseChangedThisStroke) {
-          rtSend({
-            type: 'erase_drawings',
-            removedIds: [...eraseRemovedIds],
-            addedDrawings: eraseAddedDrawings,
+          const startIds = new Set(eraseStrokeStartById.keys());
+          const doOps = [];
+          const undoOps = [];
+
+          startIds.forEach((id) => {
+            const cur = pageData.drawings.find((x) => x.id === id);
+            if (!cur || cur._deleted) {
+              doOps.push({ kind: 'delete_drawing', id });
+              undoOps.push({ kind: 'upsert_drawing', id, data: cleanDrawingData(eraseStrokeStartById.get(id)) });
+            }
           });
+          pageData.drawings.forEach((d) => {
+            if (!startIds.has(d.id) && !d._deleted) {
+              doOps.push({ kind: 'upsert_drawing', id: d.id, data: cleanDrawingData(d) });
+              undoOps.push({ kind: 'delete_drawing', id: d.id });
+            }
+          });
+
+          doOps.forEach((o) => rtSend({ ...o, stamp: eraseStrokeStamp }));
+          pushUndoRedo(doOps, undoOps);
           await savePageData();
           renderAllDrawings();
         }
@@ -1006,7 +1182,7 @@
   let submenuEl = null;
   // Remembers where the user last dragged the toolbar
   let toolbarPos = null;
-  let rtStatusEl = null; // connection indicator in the bar
+  let rtStatusEl = null; // small connection indicator in the bar
 
   const DRAW_TOOLS = [
     { id: 'pencil', label: 'Pencil' },
@@ -1334,9 +1510,25 @@
 
     clearBtn.onclick = async () => {
       if (!confirm('Remove all highlights and drawings on this page?')) return;
-      pushHistory();
-      pageData = { highlights: [], drawings: [] };
-      rtSend({ type: 'clear' });
+      const stamp = nextStamp();
+      const doOps = [];
+      const undoOps = [];
+
+      pageData.highlights.filter((h) => !h._deleted).forEach((h) => {
+        doOps.push({ kind: 'delete_highlight', id: h.id });
+        undoOps.push({ kind: 'upsert_highlight', id: h.id, anchor: h.anchor, color: h.color, createdAt: h.createdAt });
+      });
+      pageData.drawings.filter((d) => !d._deleted).forEach((d) => {
+        doOps.push({ kind: 'delete_drawing', id: d.id });
+        undoOps.push({ kind: 'upsert_drawing', id: d.id, data: cleanDrawingData(d) });
+      });
+
+      doOps.forEach((o) => {
+        const op = { ...o, stamp };
+        applyOp(op);
+        rtSend(op);
+      });
+      pushUndoRedo(doOps, undoOps);
       await savePageData();
       renderAllHighlights();
       renderAllDrawings();
@@ -1357,10 +1549,7 @@
     rightGroup.append(statusEl, undoBtn, redoBtn, clearBtn);
     bar.append(leftGroup, divider, rightGroup);
 
-    // Clicking the bar's empty background (not a button, not the drag
-    // handle) exits whichever mode is active, returning to the same
-    // cursor-is-just-a-cursor state as right after toggling the extension
-    // on, without having to click the now-active mode button again.
+    // Clicking the bar's empty background exits whichever mode is active
     bar.addEventListener('click', (e) => {
       if (mode === 'off') return;
       if (e.target.closest('button') || e.target.closest('.handle')) return;
@@ -1423,7 +1612,7 @@
     mode = 'off';
   }
 
-  // Keyboard shortcuts for undo/redo while the extension is active.
+  // Keyboard shortcuts for undo/redo
   document.addEventListener('keydown', (e) => {
     if (!enabled) return;
     const meta = e.ctrlKey || e.metaKey;
@@ -1459,36 +1648,43 @@
 
     // Existing highlights are never altered or overlapped
     const occupied = pageData.highlights
-      .filter((h) => !h.orphaned)
+      .filter((h) => !h.orphaned && !h._deleted)
       .map((h) => [h.anchor.startOffset, h.anchor.endOffset])
       .sort((a, b) => a[0] - b[0]);
 
     const remaining = subtractIntervals(newStart, newEnd, occupied);
     if (!remaining.length) return;
 
-    pushHistory();
+    const stamp = nextStamp();
+    const doOps = [];
+    const undoOps = [];
     remaining.forEach(([s, e]) => {
       const segRange = rangeFromOffsets(s, e);
       if (!segRange) return;
       const anchor = buildAnchorFromOffsets(s, e);
       const id = newId('h');
-      const highlight = { id, anchor, color: highlightColor, note: '', createdAt: Date.now() };
-      pageData.highlights.push(highlight);
+      const createdAt = Date.now();
+      const op = { kind: 'upsert_highlight', id, anchor, color: highlightColor, createdAt, stamp };
+      applyOp(op);
       paintHighlight(segRange, id, highlightColor);
-      rtSend({ type: 'add_highlight', highlight });
+      rtSend(op);
+      doOps.push({ kind: 'upsert_highlight', id, anchor, color: highlightColor, createdAt });
+      undoOps.push({ kind: 'delete_highlight', id });
     });
 
-    await savePageData();
+    if (doOps.length) {
+      pushUndoRedo(doOps, undoOps);
+      await savePageData();
+    }
   });
 
   // Realtime sync
-
   const RT_SERVER_URL = 'ws://localhost:8787';
 
   const rtClientId = newId('u');
   let rtStatus = 'disconnected'; // 'disconnected' | 'connecting' | 'connected'
   let rtPeerCount = 1;
-  let rtPendingOps = []; // ops made while offline, replayed once reconnected
+  let rtPendingOps = []; // ops made while offline, replayed once we reconnect
 
   function rtConnect() {
     rtStatus = 'connecting';
@@ -1504,7 +1700,7 @@
     api.runtime.sendMessage({ type: 'wa-rt-disconnect', room: PAGE_KEY }).catch(() => {});
   }
 
-  // Sends an op if connected. Otherwise queues it for replay on reconnect
+  // Sends an op if connected. Otherwise queues it for replay on reconnect.
   function rtSend(op) {
     if (rtStatus === 'connected') {
       api.runtime.sendMessage({ type: 'wa-rt-send', room: PAGE_KEY, op }).catch(() => {});
@@ -1513,60 +1709,36 @@
     }
   }
 
+  // Applies an op that arrived from someone else
   function rtApplyIncoming(op) {
-    switch (op.type) {
-      case 'add_highlight':
-        if (!pageData.highlights.some((h) => h.id === op.highlight.id)) {
-          pageData.highlights.push(op.highlight);
-        }
-        break;
-      case 'update_note': {
-        const h = pageData.highlights.find((h) => h.id === op.id);
-        if (h) {
-          h.note = op.note;
-          h.updatedAt = op.updatedAt;
-        }
-        break;
-      }
-      case 'delete_highlight':
-        pageData.highlights = pageData.highlights.filter((h) => h.id !== op.id);
-        break;
-      case 'add_drawing':
-        if (!pageData.drawings.some((d) => d.id === op.drawing.id)) {
-          pageData.drawings.push(op.drawing);
-        }
-        break;
-      case 'erase_drawings': {
-        const removed = new Set(op.removedIds || []);
-        pageData.drawings = pageData.drawings.filter((d) => !removed.has(d.id));
-        (op.addedDrawings || []).forEach((d) => pageData.drawings.push(d));
-        break;
-      }
-      case 'clear':
-        pageData.highlights = [];
-        pageData.drawings = [];
-        break;
-      default:
-        return;
-    }
+    applyOp(op);
     savePageData();
     renderAllHighlights();
     renderAllDrawings();
   }
 
-  // On reconnect, the server sends its canonical snapshot for the room.
-
+  // On connect, the server sends its canonical snapshot for the room
   function rtApplyInit(payload) {
-    pageData = { highlights: payload.highlights || [], drawings: payload.drawings || [] };
+    pageData = { highlights: [], drawings: [] };
+    (payload.highlights || []).forEach((h) => {
+      observeStamp(h._presenceStamp);
+      observeStamp(h._noteStamp);
+      pageData.highlights.push(h);
+    });
+    (payload.drawings || []).forEach((d) => {
+      observeStamp(d._presenceStamp);
+      pageData.drawings.push(d);
+    });
+
     const toReplay = rtPendingOps;
     rtPendingOps = [];
-    toReplay.forEach((op) => rtApplyIncoming(op));
+    toReplay.forEach((op) => applyOp(op));
+
     savePageData();
     renderAllHighlights();
     renderAllDrawings();
     toReplay.forEach((op) => rtSend(op));
   }
-
 
   // On/off toggle
 
@@ -1577,7 +1749,11 @@
     enabled = value;
 
     if (enabled) {
-      if (!pageDataLoaded) await loadPageData();
+      const currentKey = storageKeyForThisPage();
+      if (currentKey !== PAGE_KEY || !pageDataLoaded) {
+        PAGE_KEY = currentKey;
+        await loadPageData();
+      }
       buildToolbar();
       renderAllHighlights();
       renderAllDrawings();
@@ -1609,7 +1785,7 @@
 
     if (msg.type === 'wa-rt-incoming') {
       const payload = msg.payload;
-      if (!payload || typeof payload.type !== 'string') return;
+      if (!payload || typeof payload !== 'object') return;
       if (payload.type === 'init') {
         rtStatus = 'connected';
         rtApplyInit(payload);
@@ -1617,13 +1793,14 @@
       } else if (payload.type === 'presence') {
         rtPeerCount = payload.count;
         updateToolbarStatus(rtStatus, rtPeerCount);
-      } else {
+      } else if (typeof payload.kind === 'string') {
         rtApplyIncoming(payload);
       }
       return;
     }
   });
 
+  // Check if URL is the same after hash change
   window.addEventListener('hashchange', () => {
     if (enabled) {
       const currentKey = storageKeyForThisPage();
@@ -1633,5 +1810,4 @@
       }
     }
   });
-  
 })();

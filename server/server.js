@@ -36,51 +36,96 @@ function broadcastPresence(roomId, room) {
   broadcast(room, { type: 'presence', count: room.clients.size }, null);
 }
 
-// Applies one op to a room's canonical state
+// Higher lamport wins. Ties broken by clientId
+function stampWins(a, b) {
+  if (!b) return true;
+  if (!a) return false;
+  if (a.lamport !== b.lamport) return a.lamport > b.lamport;
+  if (a.clientId !== b.clientId) return a.clientId > b.clientId;
+  return true;
+}
+
+// Applies one op to a room's canonical state, mirroring applyOp() in content.js
 function applyOp(state, op) {
-  switch (op.type) {
-    case 'add_highlight':
-      if (!state.highlights.some((h) => h.id === op.highlight.id)) {
-        state.highlights.push(op.highlight);
+  switch (op.kind) {
+    case 'upsert_highlight': {
+      let h = state.highlights.find((x) => x.id === op.id);
+      if (!h) {
+        h = {
+          id: op.id,
+          anchor: op.anchor,
+          color: op.color,
+          createdAt: op.createdAt,
+          note: '',
+          _presenceStamp: op.stamp,
+          _noteStamp: op.stamp,
+          _deleted: false,
+        };
+        state.highlights.push(h);
+      } else if (stampWins(op.stamp, h._presenceStamp)) {
+        h.anchor = op.anchor;
+        h.color = op.color;
+        h.createdAt = op.createdAt;
+        h._deleted = false;
+        h._presenceStamp = op.stamp;
       }
       break;
+    }
+    case 'delete_highlight': {
+      const h = state.highlights.find((x) => x.id === op.id);
+      if (h && stampWins(op.stamp, h._presenceStamp)) {
+        h._deleted = true;
+        h._presenceStamp = op.stamp;
+      }
+      break;
+    }
     case 'update_note': {
-      const h = state.highlights.find((h) => h.id === op.id);
-      if (h) {
+      const h = state.highlights.find((x) => x.id === op.id);
+      if (h && stampWins(op.stamp, h._noteStamp)) {
         h.note = op.note;
         h.updatedAt = op.updatedAt;
+        h._noteStamp = op.stamp;
       }
       break;
     }
-    case 'delete_highlight':
-      state.highlights = state.highlights.filter((h) => h.id !== op.id);
-      break;
-    case 'add_drawing':
-      if (!state.drawings.some((d) => d.id === op.drawing.id)) {
-        state.drawings.push(op.drawing);
+    case 'upsert_drawing': {
+      let d = state.drawings.find((x) => x.id === op.id);
+      if (!d) {
+        d = { ...op.data, id: op.id, _presenceStamp: op.stamp, _deleted: false };
+        state.drawings.push(d);
+      } else if (stampWins(op.stamp, d._presenceStamp)) {
+        Object.assign(d, op.data);
+        d._deleted = false;
+        d._presenceStamp = op.stamp;
       }
       break;
-    case 'erase_drawings': {
-      const removed = new Set(op.removedIds || []);
-      state.drawings = state.drawings.filter((d) => !removed.has(d.id));
-      (op.addedDrawings || []).forEach((d) => state.drawings.push(d));
+    }
+    case 'delete_drawing': {
+      const d = state.drawings.find((x) => x.id === op.id);
+      if (d && stampWins(op.stamp, d._presenceStamp)) {
+        d._deleted = true;
+        d._presenceStamp = op.stamp;
+      }
       break;
     }
-    case 'clear':
-      state.highlights = [];
-      state.drawings = [];
-      break;
     default:
-      break; // unknown op type
+      break; // unknown op kind, ignore
   }
 }
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Web Annotator realtime server is running.\n');
+  res.end('CoScribble realtime server is running.\n');
 });
 
 const wss = new WebSocketServer({ server });
+
+// Heartbeat to detect dead socket
+const HEARTBEAT_INTERVAL_MS = 30000;
+
+function heartbeat() {
+  this.isAlive = true;
+}
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -92,10 +137,13 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
+  ws.isAlive = true;
+  ws.on('pong', heartbeat);
+
   const room = getRoom(roomId);
   room.clients.set(ws, clientId);
 
-  // New/reconnecting clients always get a full snapshot first so they can reconcile
+  // New clients get a full snapshot first so they can reconcile against local cache
   ws.send(JSON.stringify({ type: 'init', highlights: room.state.highlights, drawings: room.state.drawings }));
   broadcastPresence(roomId, room);
 
@@ -106,7 +154,7 @@ wss.on('connection', (ws, req) => {
     } catch (e) {
       return;
     }
-    if (!op || typeof op.type !== 'string') return;
+    if (!op || typeof op.kind !== 'string') return;
 
     applyOp(room.state, op);
     saveRoom(roomId, room.state);
@@ -120,6 +168,19 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
+
 server.listen(PORT, () => {
-  console.log(`Web Annotator realtime server listening on :${PORT}`);
+  console.log(`CoScribble realtime server listening on :${PORT}`);
 });

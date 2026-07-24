@@ -5,10 +5,29 @@ const api = globalThis.browser || globalThis.chrome;
 // roomId to { ws, serverUrl, reconnectAttempts, reconnectTimer, closedByUs }
 const sockets = new Map();
 
+// roomId to the most recent {type: 'init', highlights, drawings} snapshot the server sent for that room
+const lastSnapshot = new Map();
+
+function statusForReadyState(ws) {
+  if (!ws) return 'disconnected';
+  if (ws.readyState === WebSocket.OPEN) return 'connected';
+  if (ws.readyState === WebSocket.CONNECTING) return 'connecting';
+  return 'disconnected';
+}
+
 function connect(room, serverUrl, clientId) {
   let entry = sockets.get(room);
   if (entry && entry.ws && (entry.ws.readyState === WebSocket.OPEN || entry.ws.readyState === WebSocket.CONNECTING)) {
-    return; // already connected/connecting for this room
+    // Already connected/connecting for this room
+    const snapshot = lastSnapshot.get(room);
+    if (snapshot) {
+      api.runtime.sendMessage({ type: 'wa-off-event', room, event: 'message', payload: snapshot }).catch(() => {});
+    } else {
+      api.runtime
+        .sendMessage({ type: 'wa-off-event', room, event: 'status', status: statusForReadyState(entry.ws) })
+        .catch(() => {});
+    }
+    return;
   }
   entry = entry || { ws: null, serverUrl, clientId, reconnectAttempts: 0, reconnectTimer: null, closedByUs: false };
   entry.serverUrl = serverUrl;
@@ -38,10 +57,14 @@ function openSocket(room) {
     } catch (err) {
       return;
     }
+    if (payload && payload.type === 'init') {
+      lastSnapshot.set(room, payload);
+    }
     api.runtime.sendMessage({ type: 'wa-off-event', room, event: 'message', payload }).catch(() => {});
   });
 
   ws.addEventListener('close', () => {
+    lastSnapshot.delete(room);
     api.runtime.sendMessage({ type: 'wa-off-event', room, event: 'close' }).catch(() => {});
     if (entry.closedByUs) return;
     // Exponential backoff
@@ -61,6 +84,7 @@ function disconnect(room) {
   clearTimeout(entry.reconnectTimer);
   if (entry.ws) entry.ws.close();
   sockets.delete(room);
+  lastSnapshot.delete(room);
 }
 
 function send(room, op) {

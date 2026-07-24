@@ -1,7 +1,5 @@
 'use strict';
 
-// A minimal persistence layer
-
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -21,7 +19,7 @@ function recordIndex(roomId) {
   try {
     index = JSON.parse(fs.readFileSync(INDEX_FILE, 'utf8'));
   } catch (e) {
-    // no index yet, or it is corrupt
+    // no index yet, or it's corrupt — start fresh
   }
   index[path.basename(filenameFor(roomId))] = roomId;
   fs.writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
@@ -37,7 +35,7 @@ function loadRoom(roomId) {
   }
 }
 
-const pendingWrites = new Map(); // roomId -> Timeout
+const pendingWrites = new Map(); // roomId to Timeout
 
 function saveRoom(roomId, state) {
   recordIndex(roomId);

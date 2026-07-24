@@ -1,8 +1,8 @@
 {
-  "name": "web-annotator-server",
+  "name": "coscribble-server",
   "version": "0.1.0",
   "private": true,
-  "description": "Realtime sync server for Web Annotator — one shared room per normalized page URL. No auth/groups (step 5) and no CRDT merge (step 4) yet; last-write-wins.",
+  "description": "Realtime sync server for CoScribble. There is one shared room per normalized page URL.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
