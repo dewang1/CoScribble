@@ -73,3 +73,7 @@ The extension currently points at `ws://localhost:8787`.
 4. Use the undo/redo icons (or the keyboard shortcuts) to step back and forward through your changes.
 5. The status indicator in the toolbar shows whether you're connected to the sync server and how many others are viewing the same page.
 6. Use the trash icon to clear all highlights and drawings from the current page.
+
+## License
+
+MIT License — see LICENSE file for details.
