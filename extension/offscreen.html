@@ -1,11 +1,7 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>CoScr realtime relay</title></head>
+<head><meta charset="utf-8"><title>CoScribble realtime relay</title></head>
 <body>
-  <!-- This page is never shown to the user. Its only job is to hold a
-       WebSocket connection that would otherwise be killed by MV3 service
-       worker teardown, or blocked by a host page's CSP if opened from a
-       content script. See offscreen.js. -->
   <script src="offscreen.js"></script>
 </body>
 </html>
