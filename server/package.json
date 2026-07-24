@@ -1,0 +1,13 @@
+{
+  "name": "web-annotator-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Realtime sync server for Web Annotator — one shared room per normalized page URL. No auth/groups (step 5) and no CRDT merge (step 4) yet; last-write-wins.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

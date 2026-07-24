@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Web Annotator (Prototype)",
-  "version": "0.1.0",
-  "description": "Highlight, comment on, and draw over any webpage. Click the toolbar icon to turn it on for the current tab. Annotations persist locally and re-anchor on reload.",
-  "permissions": ["storage"],
+  "version": "0.2.0",
+  "description": "Highlight, comment on, and draw (pencil, shapes, text) over any webpage, with custom colors and undo/redo. Click the toolbar icon to turn it on for the current tab. Annotations persist locally, re-anchor on reload, and sync live with anyone else viewing the same page via a small realtime server.",
+  "permissions": ["storage", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"

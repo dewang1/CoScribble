@@ -1,30 +1,38 @@
-/* Highlight fragments */
+/* Highlight fragments.*/
 .wa-highlight {
   border-radius: 0;
   cursor: pointer;
   transition: filter 0.15s ease;
 }
-.wa-highlight:hover {
+
+/* Hover state is toggled by JS*/
+.wa-highlight.wa-hl-hover {
   filter: brightness(0.92);
 }
+
 .wa-highlight.wa-orphan-hint {
   outline: 1px dashed rgba(200, 60, 60, 0.6);
 }
 
-/* Note icon */
+/* Note icon for highlights */
 .wa-note-icon {
+  position: absolute;
+  z-index: 2147483000;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 15px;
   height: 15px;
-  margin-left: 2px;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
   color: #4b5563;
   cursor: pointer;
-  vertical-align: text-top;
+  transition: filter 0.15s ease;
 }
-.wa-note-icon:hover {
-  color: #1f2937;
+.wa-note-icon.wa-hl-hover {
+  filter: brightness(0.92);
 }
 
 /* Full-document drawing overlay */
