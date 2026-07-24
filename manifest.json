@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Web Annotator (Prototype)",
+  "version": "0.1.0",
+  "description": "Highlight, comment on, and draw over any webpage. Click the toolbar icon to turn it on for the current tab. Annotations persist locally and re-anchor on reload.",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Toggle Web Annotator on this page"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

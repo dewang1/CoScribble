@@ -1,0 +1,81 @@
+/* Highlight fragments */
+.wa-highlight {
+  border-radius: 0;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+.wa-highlight:hover {
+  filter: brightness(0.92);
+}
+.wa-highlight.wa-orphan-hint {
+  outline: 1px dashed rgba(200, 60, 60, 0.6);
+}
+
+/* Note icon */
+.wa-note-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-left: 2px;
+  color: #4b5563;
+  cursor: pointer;
+  vertical-align: text-top;
+}
+.wa-note-icon:hover {
+  color: #1f2937;
+}
+
+/* Full-document drawing overlay */
+#wa-draw-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2147483000;
+  pointer-events: none;
+}
+#wa-draw-layer.wa-draw-active {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+/* Note popover */
+.wa-popover {
+  position: absolute;
+  z-index: 2147483647;
+  background: #fff;
+  color: #1a1a1a;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  padding: 10px;
+  width: 240px;
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.wa-popover textarea {
+  width: 100%;
+  min-height: 60px;
+  box-sizing: border-box;
+  font: inherit;
+  resize: vertical;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 6px;
+}
+.wa-popover .wa-popover-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+}
+.wa-popover button {
+  font: inherit;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.wa-popover .wa-save { background: #2563eb; color: #fff; }
+.wa-popover .wa-delete { background: #f3f4f6; color: #b91c1c; }
+.wa-popover .wa-close { background: #f3f4f6; color: #333; }
