@@ -626,7 +626,7 @@
     if (drawLayer) return drawLayer;
     drawLayer = document.createElementNS(SVG_NS, 'svg');
     drawLayer.id = 'wa-draw-layer';
-    drawLayer.style.cssText = 'position: absolute; top: 0; left: 0; z-index: 2147483645;';
+    drawLayer.style.cssText = 'position: absolute; top: 0; left: 0; z-index: 2147483645; touch-action: none; user-select: none;';
     document.documentElement.appendChild(drawLayer);
     resizeDrawLayer();
     if (!resizeObserverAttached) {
@@ -954,6 +954,7 @@
 
   async function handlePointerDown(e) {
     if (!enabled || mode !== 'draw') return;
+    e.preventDefault();
     const p = toPagePoint(e);
     switch (currentDrawTool) {
       case 'pencil':
