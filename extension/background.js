@@ -99,7 +99,6 @@ async function ensureOffscreen() {
   return offscreenReadyPromise;
 }
 
-// tabId to room key; room key -> [tabId]
 // Lets us route incoming server message for a room to every tab viewing the room
 // Tell the offscreen document when a room has no tabs left and its socket can be closed
 async function joinRoom(tabId, room) {
